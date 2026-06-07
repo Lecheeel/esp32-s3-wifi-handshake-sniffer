@@ -130,7 +130,7 @@ arduino
 littlefs
 wifi-security
 ```
-
+<!-- 
 ## License
 
-No license has been selected yet. Add a license before publishing if you want to define how others may use this project.
+No license has been selected yet. Add a license before publishing if you want to define how others may use this project. -->
