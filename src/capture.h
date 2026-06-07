@@ -1,0 +1,46 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
+#include <Arduino.h>
+
+namespace Capture {
+
+extern bool     isRunning;
+extern bool     handshakeFound;
+extern bool     pmkidFound;
+extern uint32_t frameCount;
+extern uint32_t eapolCount;
+extern uint32_t pmkidCount;
+extern uint8_t  captureChannel;
+
+void setup();
+void start(uint8_t channel, const uint8_t* targetBSSID, bool fullChannel = false);
+void stop();
+void loop();
+void reset();
+
+bool usesFullChannel();
+bool managementApActive();
+const char* getLastError();
+const char* getCaptureSummary();
+uint32_t    getRawChannelFrames();
+uint32_t    getTargetFrames();
+bool        hasLatestCapture();
+bool        hasLatestMetadata();
+size_t      getLatestPcapSize();
+size_t      getLatestPmkidSize();
+size_t      getLatestMetaSize();
+
+const uint8_t* getPcapData();
+size_t         getPcapSize();
+const char*    getPmkidData();
+size_t         getPmkidSize();
+bool           loadLatestPcap(std::vector<uint8_t>& out);
+bool           loadLatestPmkid(String& out);
+bool           loadLatestMeta(String& out);
+bool           clearLatestSaved();
+
+}  // namespace Capture

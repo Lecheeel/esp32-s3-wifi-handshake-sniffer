@@ -1,0 +1,909 @@
+#include "capture.h"
+
+#include <Arduino.h>
+#include <LittleFS.h>
+#include <WiFi.h>
+#include <esp_wifi.h>
+
+#include <array>
+#include <cstdio>
+#include <cstring>
+#include <vector>
+
+namespace Capture {
+
+bool     isRunning      = false;
+bool     handshakeFound = false;
+bool     pmkidFound     = false;
+uint32_t frameCount     = 0;
+uint32_t eapolCount     = 0;
+uint32_t pmkidCount     = 0;
+uint8_t  captureChannel = 1;
+
+namespace {
+
+constexpr const char* kMgmtApSsid = "esp32-s3-wifi-handshake-sniffer";
+constexpr const char* kLatestPcapPath = "/latest_capture.pcap";
+constexpr const char* kLatestPmkidPath = "/latest_capture.22000";
+constexpr const char* kLatestMetaPath = "/latest_capture.json";
+constexpr size_t PCAP_CHUNK = 8 * 1024;
+constexpr size_t MAX_PMKID = 10;
+
+bool     fullChannelMode  = false;
+bool     apActive         = true;
+bool     fsReady          = false;
+bool     latestPcapKnown  = false;
+bool     latestPmkidKnown = false;
+bool     latestMetaKnown  = false;
+uint8_t  targetBssid[6]   = {0};
+char     capSummary[160]  = "";
+char     lastError[160]   = "";
+size_t   pcapWritePos     = 0;
+uint32_t startMs          = 0;
+uint32_t lastDiagMs       = 0;
+bool     firstFrameSeen   = false;
+bool     idleWarningShown = false;
+uint32_t rawChannelFrames = 0;
+uint16_t savedBeaconFrames = 0;
+uint16_t savedProbeRespFrames = 0;
+uint32_t pcapDroppedRecords = 0;
+size_t   pcapActivePos = 0;
+size_t   pcapFlushLen = 0;
+bool     pcapFlushPending = false;
+bool     pcapFileOpen = false;
+
+File pcapFile;
+std::array<uint8_t, PCAP_CHUNK> pcapActiveBuf;
+std::array<uint8_t, PCAP_CHUNK> pcapFlushBuf;
+String pmkidBuf;
+std::array<std::array<uint8_t, 16>, MAX_PMKID> pmkidList;
+std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidApList;
+std::array<std::array<uint8_t, 6>, MAX_PMKID>  pmkidStaList;
+int pmkidStored = 0;
+
+struct HandshakeState {
+    uint8_t ap[6] = {0};
+    uint8_t sta[6] = {0};
+    bool used = false;
+    bool m1 = false;
+    bool m2 = false;
+    bool m3 = false;
+    bool m4 = false;
+    uint64_t lastReplay = 0;
+    uint8_t lastLoggedMsg = 0;
+};
+
+std::array<HandshakeState, 8> handshakes;
+
+const uint8_t PCAP_GHDR[] = {
+    0xD4, 0xC3, 0xB2, 0xA1, 0x02, 0x00, 0x04, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0x00, 0x00, 0x7F, 0x00, 0x00, 0x00
+};
+
+uint8_t rtTmpl[18] = {
+    0x00, 0x00, 0x12, 0x00, 0x34, 0x00, 0x20, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00
+};
+
+uint16_t ch2freq(uint8_t ch) {
+    if (ch == 14) return 2484;
+    if (ch >= 1 && ch <= 13) return 2407 + ch * 5;
+    return 2412;
+}
+
+uint16_t ch2flags(uint16_t f) {
+    return (f >= 5000) ? 0x0140 : 0x00A0;
+}
+
+void startManagementAp() {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_MODE_APSTA);
+    WiFi.softAP(kMgmtApSsid, nullptr, 1, 0, 4);
+    apActive = true;
+    Serial.println("[Capture] Management AP restored");
+}
+
+void stopManagementAp() {
+    Serial.println("[Capture] Management AP stopping for passive sniff");
+    WiFi.softAPdisconnect(true);
+    apActive = false;
+}
+
+void resetHandshakeState() {
+    for (auto& hs : handshakes) {
+        hs = HandshakeState{};
+    }
+}
+
+void copyMac(uint8_t* dst, const uint8_t* src) {
+    memcpy(dst, src, 6);
+}
+
+bool sameMac(const uint8_t* a, const uint8_t* b) {
+    return memcmp(a, b, 6) == 0;
+}
+
+bool matchesTarget(const uint8_t* pkt, uint16_t len) {
+    if (fullChannelMode) return true;
+    if (len < 24) return false;
+
+    uint8_t fc = pkt[0];
+    uint8_t type = (fc >> 2) & 0x03;
+
+    if (type == 0) {
+        return sameMac(pkt + 16, targetBssid);
+    }
+
+    if (type == 2) {
+        return sameMac(pkt + 4, targetBssid) ||
+               sameMac(pkt + 10, targetBssid) ||
+               sameMac(pkt + 16, targetBssid);
+    }
+
+    return false;
+}
+
+void getAddrs(const uint8_t* pkt, uint8_t* sa, uint8_t* da) {
+    uint8_t fc = pkt[0];
+    bool toDs = fc & 1;
+    bool fromDs = fc & 2;
+    if (toDs && !fromDs) {
+        if (da) memcpy(da, pkt + 4, 6);
+        if (sa) memcpy(sa, pkt + 10, 6);
+    } else if (fromDs && !toDs) {
+        if (da) memcpy(da, pkt + 4, 6);
+        if (sa) memcpy(sa, pkt + 16, 6);
+    } else if (toDs && fromDs) {
+        if (da) memcpy(da, pkt + 4, 6);
+        if (sa) memcpy(sa, pkt + 24, 6);
+    } else {
+        if (da) memcpy(da, pkt + 4, 6);
+        if (sa) memcpy(sa, pkt + 10, 6);
+    }
+}
+
+int findEapol(const uint8_t* pkt, uint16_t len) {
+    for (int i = 24; i < len - 7; ++i) {
+        if (pkt[i] == 0xAA && pkt[i + 1] == 0xAA && pkt[i + 2] == 0x03 &&
+            pkt[i + 6] == 0x88 && pkt[i + 7] == 0x8E) {
+            return i + 8;
+        }
+    }
+    return -1;
+}
+
+void macStr(const uint8_t* m, char* out) {
+    snprintf(out, 18, "%02X%02X%02X%02X%02X%02X", m[0], m[1], m[2], m[3], m[4], m[5]);
+}
+
+bool isPmkidDuplicate(const uint8_t* pmkid) {
+    for (int i = 0; i < pmkidStored; ++i) {
+        if (memcmp(pmkidList[i].data(), pmkid, 16) == 0) return true;
+    }
+    return false;
+}
+
+void addPmkid(const uint8_t* pmkid, const uint8_t* ap, const uint8_t* sta) {
+    if (pmkidStored >= (int)MAX_PMKID || isPmkidDuplicate(pmkid)) return;
+    memcpy(pmkidList[pmkidStored].data(), pmkid, 16);
+    if (ap) memcpy(pmkidApList[pmkidStored].data(), ap, 6);
+    else memset(pmkidApList[pmkidStored].data(), 0xFF, 6);
+    if (sta) memcpy(pmkidStaList[pmkidStored].data(), sta, 6);
+    else memset(pmkidStaList[pmkidStored].data(), 0xFF, 6);
+    pmkidStored++;
+    pmkidCount = pmkidStored;
+    pmkidFound = true;
+    char apStr[18], staStr[18];
+    macStr(pmkidApList[pmkidStored - 1].data(), apStr);
+    macStr(pmkidStaList[pmkidStored - 1].data(), staStr);
+    Serial.printf("[Capture] PMKID captured #%u AP=%s STA=%s\n",
+                  (unsigned)pmkidCount, apStr, staStr);
+}
+
+void extractPmkidFromM1(const uint8_t* pkt, uint16_t len, int off, const uint8_t* sta, const uint8_t* ap) {
+    int kdStart = off + 95;
+    if (kdStart + 6 > len) return;
+    int searchEnd = len - 22;
+    for (int i = kdStart; i <= searchEnd; ++i) {
+        if (pkt[i] == 0xDD && pkt[i + 2] == 0x00 && pkt[i + 3] == 0x0F &&
+            pkt[i + 4] == 0xAC && pkt[i + 5] == 0x04) {
+            addPmkid(pkt + i + 6, ap, sta);
+            return;
+        }
+    }
+}
+
+void extractPmkidFromBeacon(const uint8_t* pkt, uint16_t len, const uint8_t* bssid) {
+    for (int i = 24; i < len - 20; ++i) {
+        if (pkt[i] == 0x30 && pkt[i + 2] == 0x00 && pkt[i + 3] == 0x0F && pkt[i + 4] == 0xAC) {
+            int rsnLen = pkt[i + 1];
+            int pos = i + 6;
+            if (pos + 6 > i + 2 + rsnLen) return;
+            pos += 4;
+            uint16_t pairCnt = pkt[pos] | (pkt[pos + 1] << 8);
+            pos += 2 + pairCnt * 4;
+            if (pos + 2 > i + 2 + rsnLen) return;
+            uint16_t akmCnt = pkt[pos] | (pkt[pos + 1] << 8);
+            pos += 2 + akmCnt * 4 + 2;
+            if (pos + 2 > i + 2 + rsnLen) return;
+            uint16_t pmkidCnt = pkt[pos] | (pkt[pos + 1] << 8);
+            pos += 2;
+            for (int j = 0; j < pmkidCnt && pos + 16 <= i + 2 + rsnLen; ++j) {
+                addPmkid(pkt + pos, bssid, nullptr);
+                pos += 16;
+            }
+            return;
+        }
+    }
+}
+
+HandshakeState* getHandshakeState(const uint8_t* ap, const uint8_t* sta) {
+    for (auto& hs : handshakes) {
+        if (hs.used && sameMac(hs.ap, ap) && sameMac(hs.sta, sta)) {
+            return &hs;
+        }
+    }
+    for (auto& hs : handshakes) {
+        if (!hs.used) {
+            hs.used = true;
+            copyMac(hs.ap, ap);
+            copyMac(hs.sta, sta);
+            return &hs;
+        }
+    }
+    return &handshakes[0];
+}
+
+void updateSummary() {
+    int n = 0;
+    if (pmkidCount) n += snprintf(capSummary + n, sizeof(capSummary) - n, "PMKID=%lu ", (unsigned long)pmkidCount);
+    if (eapolCount) n += snprintf(capSummary + n, sizeof(capSummary) - n, "EAPOL=%lu ", (unsigned long)eapolCount);
+    if (handshakeFound) snprintf(capSummary + n, sizeof(capSummary) - n, "HS=complete");
+}
+
+String buildSessionMetaJson(uint32_t elapsedSec) {
+    String out;
+    out.reserve(320);
+    out += "{\"channel\":";
+    out += String(captureChannel);
+    out += ",\"mode\":\"";
+    out += fullChannelMode ? "full" : "target";
+    out += "\",\"rawFrames\":";
+    out += String(rawChannelFrames);
+    out += ",\"targetFrames\":";
+    out += String(frameCount);
+    out += ",\"eapol\":";
+    out += String(eapolCount);
+    out += ",\"pmkidCount\":";
+    out += String(pmkidCount);
+    out += ",\"handshake\":";
+    out += handshakeFound ? "true" : "false";
+    out += ",\"elapsedSec\":";
+    out += String(elapsedSec);
+    out += ",\"pcapBytes\":";
+    out += String((unsigned)pcapWritePos);
+    out += ",\"pmkidBytes\":";
+    out += String((unsigned)strlen(getPmkidData()));
+    out += ",\"summary\":\"";
+    out += getCaptureSummary();
+    out += "\"}";
+    return out;
+}
+
+bool fileExistsNoisySafe(const char* path) {
+    if (!fsReady) return false;
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) return false;
+    f.close();
+    return true;
+}
+
+size_t fileSizeNoisySafe(const char* path) {
+    if (!fsReady) return 0;
+    File f = LittleFS.open(path, FILE_READ);
+    if (!f) return 0;
+    size_t sz = f.size();
+    f.close();
+    return sz;
+}
+
+void analyzeKey(const uint8_t* pkt, uint16_t len, int off) {
+    if (off < 0 || off + 17 > len) return;
+    if (pkt[off + 1] != 0x03) return;
+
+    uint16_t ki = pkt[off + 6] | (pkt[off + 7] << 8);
+    const bool pairwise = ((ki >> 3) & 1) != 0;
+    if (!pairwise) return;
+
+    eapolCount++;
+
+    uint8_t sa[6], da[6];
+    getAddrs(pkt, sa, da);
+
+    const bool mic = ((ki >> 6) & 1) != 0;
+    const bool ack = ((ki >> 7) & 1) != 0;
+    const bool inst = ((ki >> 4) & 1) != 0;
+    const bool sec = ((ki >> 9) & 1) != 0;
+    uint64_t replay = 0;
+    for (int i = 0; i < 8; ++i) {
+        replay = (replay << 8) | pkt[off + 9 + i];
+    }
+
+    uint8_t ap[6], sta[6];
+    if (ack) {
+        copyMac(ap, sa);
+        copyMac(sta, da);
+    } else {
+        copyMac(ap, da);
+        copyMac(sta, sa);
+    }
+
+    HandshakeState* hs = getHandshakeState(ap, sta);
+    uint8_t msgType = 0;
+
+    if (ack && !mic && !inst && !sec && !hs->m1) {
+        hs->m1 = true;
+        msgType = 1;
+        char apStr[18], staStr[18];
+        macStr(ap, apStr);
+        macStr(sta, staStr);
+        Serial.printf("[Capture] EAPOL M1 AP=%s STA=%s ki=0x%04X replay=%llu\n",
+                      apStr, staStr, ki, replay);
+        extractPmkidFromM1(pkt, len, off, sta, ap);
+    } else if (!ack && mic && !inst && !sec && !hs->m2) {
+        hs->m2 = true;
+        msgType = 2;
+        char apStr[18], staStr[18];
+        macStr(ap, apStr);
+        macStr(sta, staStr);
+        Serial.printf("[Capture] EAPOL M2 AP=%s STA=%s ki=0x%04X replay=%llu\n",
+                      apStr, staStr, ki, replay);
+    } else if (ack && mic && inst && sec && !hs->m3) {
+        hs->m3 = true;
+        msgType = 3;
+        char apStr[18], staStr[18];
+        macStr(ap, apStr);
+        macStr(sta, staStr);
+        Serial.printf("[Capture] EAPOL M3 AP=%s STA=%s ki=0x%04X replay=%llu\n",
+                      apStr, staStr, ki, replay);
+    } else if (!ack && mic && !inst && sec && !hs->m4) {
+        hs->m4 = true;
+        msgType = 4;
+        char apStr[18], staStr[18];
+        macStr(ap, apStr);
+        macStr(sta, staStr);
+        Serial.printf("[Capture] EAPOL M4 AP=%s STA=%s ki=0x%04X replay=%llu\n",
+                      apStr, staStr, ki, replay);
+    } else if (hs->lastReplay != replay || hs->lastLoggedMsg == 0) {
+        char apStr[18], staStr[18];
+        macStr(ap, apStr);
+        macStr(sta, staStr);
+        Serial.printf("[Capture] EAPOL other AP=%s STA=%s ki=0x%04X ack=%u mic=%u inst=%u sec=%u replay=%llu\n",
+                      apStr, staStr, ki, ack ? 1 : 0, mic ? 1 : 0, inst ? 1 : 0, sec ? 1 : 0, replay);
+    }
+
+    hs->lastReplay = replay;
+    if (msgType != 0) hs->lastLoggedMsg = msgType;
+
+    if (hs->m1 && hs->m2 && hs->m3 && hs->m4 && !handshakeFound) {
+        handshakeFound = true;
+        char apStr[18], staStr[18];
+        macStr(ap, apStr);
+        macStr(sta, staStr);
+        Serial.printf("[Capture] Handshake complete AP=%s STA=%s\n", apStr, staStr);
+    }
+
+    updateSummary();
+}
+
+void writePcapRecord(const uint8_t* frame, uint16_t len, int8_t rssi) {
+    const size_t recordSize = len + 34;
+    if (!pcapFileOpen || recordSize > PCAP_CHUNK) return;
+
+    uint32_t us = micros();
+    uint32_t secs = us / 1000000;
+    uint32_t usecs = us % 1000000;
+    uint32_t packetLen = 18 + len;
+    uint8_t hdr[16];
+    hdr[0] = secs & 0xFF; hdr[1] = (secs >> 8) & 0xFF; hdr[2] = (secs >> 16) & 0xFF; hdr[3] = (secs >> 24) & 0xFF;
+    hdr[4] = usecs & 0xFF; hdr[5] = (usecs >> 8) & 0xFF; hdr[6] = (usecs >> 16) & 0xFF; hdr[7] = (usecs >> 24) & 0xFF;
+    hdr[8] = packetLen & 0xFF; hdr[9] = (packetLen >> 8) & 0xFF; hdr[10] = (packetLen >> 16) & 0xFF; hdr[11] = (packetLen >> 24) & 0xFF;
+    hdr[12] = hdr[8]; hdr[13] = hdr[9]; hdr[14] = hdr[10]; hdr[15] = hdr[11];
+
+    uint8_t rt[18];
+    memcpy(rt, rtTmpl, sizeof(rt));
+    uint16_t freq = ch2freq(captureChannel);
+    uint16_t flags = ch2flags(freq);
+    rt[10] = freq & 0xFF;
+    rt[11] = (freq >> 8) & 0xFF;
+    rt[12] = flags & 0xFF;
+    rt[13] = (flags >> 8) & 0xFF;
+    rt[14] = (uint8_t)rssi;
+
+    noInterrupts();
+    if (pcapActivePos + recordSize > PCAP_CHUNK) {
+        if (pcapFlushPending) {
+            pcapDroppedRecords++;
+            interrupts();
+            return;
+        }
+        memcpy(pcapFlushBuf.data(), pcapActiveBuf.data(), pcapActivePos);
+        pcapFlushLen = pcapActivePos;
+        pcapFlushPending = true;
+        pcapActivePos = 0;
+    }
+
+    memcpy(pcapActiveBuf.data() + pcapActivePos, hdr, sizeof(hdr));
+    pcapActivePos += sizeof(hdr);
+    memcpy(pcapActiveBuf.data() + pcapActivePos, rt, sizeof(rt));
+    pcapActivePos += sizeof(rt);
+    memcpy(pcapActiveBuf.data() + pcapActivePos, frame, len);
+    pcapActivePos += len;
+    pcapWritePos += recordSize;
+    interrupts();
+}
+
+void flushPendingPcapChunk() {
+    if (!pcapFileOpen || !pcapFlushPending) return;
+
+    size_t len = 0;
+    noInterrupts();
+    len = pcapFlushLen;
+    interrupts();
+
+    if (len > 0) {
+        pcapFile.write(pcapFlushBuf.data(), len);
+    }
+
+    noInterrupts();
+    pcapFlushLen = 0;
+    pcapFlushPending = false;
+    interrupts();
+}
+
+void flushActivePcapChunk() {
+    if (!pcapFileOpen) return;
+
+    noInterrupts();
+    size_t len = pcapActivePos;
+    pcapActivePos = 0;
+    interrupts();
+
+    if (len > 0) {
+        pcapFile.write(pcapActiveBuf.data(), len);
+    }
+}
+
+void closePcapFile() {
+    if (!pcapFileOpen) return;
+    flushPendingPcapChunk();
+    flushActivePcapChunk();
+    pcapFile.flush();
+    pcapFile.close();
+    pcapFileOpen = false;
+}
+
+bool shouldSaveFrame(uint8_t frameType, uint8_t subtype, bool hasEapol) {
+    if (hasEapol) return true;
+    if (frameType != 0) return false;
+
+    switch (subtype) {
+        case 0x00:  // Association request
+        case 0x01:  // Association response
+        case 0x02:  // Reassociation request
+        case 0x03:  // Reassociation response
+        case 0x0B:  // Authentication
+            return true;
+        case 0x05:  // Probe response
+            if (savedProbeRespFrames < 3) {
+                savedProbeRespFrames++;
+                return true;
+            }
+            return false;
+        case 0x08:  // Beacon
+            if (savedBeaconFrames < 3) {
+                savedBeaconFrames++;
+                return true;
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
+void rxCallback(void* buf, wifi_promiscuous_pkt_type_t) {
+    if (!isRunning) return;
+
+    auto* pkt = static_cast<wifi_promiscuous_pkt_t*>(buf);
+    uint16_t len = pkt->rx_ctrl.sig_len;
+    if (len < 24 || len > 2500) return;
+    rawChannelFrames++;
+
+    const uint8_t* payload = pkt->payload;
+    if (!matchesTarget(payload, len)) return;
+
+    if (!firstFrameSeen) {
+        firstFrameSeen = true;
+        Serial.printf("[Capture] First matching frame seen after %lus\n",
+                      (unsigned long)((millis() - startMs) / 1000));
+    }
+    frameCount++;
+    if ((frameCount % 100) == 0) {
+        Serial.printf("[Capture] Matching frames=%lu EAPOL=%lu PMKID=%lu\n",
+                      (unsigned long)frameCount,
+                      (unsigned long)eapolCount,
+                      (unsigned long)pmkidCount);
+    }
+
+    uint8_t fc = payload[0];
+    uint8_t frameType = (fc >> 2) & 0x03;
+    uint8_t subtype = (fc >> 4) & 0x0F;
+    if (frameType == 0) {
+        if (subtype == 0x08 || subtype == 0x05) {
+            uint8_t bssid[6];
+            memcpy(bssid, payload + 16, 6);
+            extractPmkidFromBeacon(payload, len, bssid);
+        }
+    }
+
+    int eapolOffset = findEapol(payload, len);
+    if (shouldSaveFrame(frameType, subtype, eapolOffset >= 0)) {
+        writePcapRecord(payload, len, pkt->rx_ctrl.rssi);
+    }
+    if (eapolOffset >= 0) {
+        analyzeKey(payload, len, eapolOffset);
+    }
+}
+
+}  // namespace
+
+void setup() {
+    pmkidBuf.reserve(512);
+    fsReady = LittleFS.begin(true);
+    Serial.printf("[Capture] LittleFS %s\n", fsReady ? "ready" : "init failed");
+    latestPcapKnown = fileSizeNoisySafe(kLatestPcapPath) > 24;
+    latestPmkidKnown = fileSizeNoisySafe(kLatestPmkidPath) > 0;
+    latestMetaKnown = fileSizeNoisySafe(kLatestMetaPath) > 0;
+    if (fsReady) {
+        Serial.printf("[Capture] Saved files on boot: pcap=%s pmkid=%s meta=%s\n",
+                      latestPcapKnown ? "yes" : "no",
+                      latestPmkidKnown ? "yes" : "no",
+                      latestMetaKnown ? "yes" : "no");
+    }
+}
+
+void start(uint8_t channel, const uint8_t* bssid, bool fullChannel) {
+    if (isRunning) stop();
+
+    lastError[0] = '\0';
+    if (!fullChannel && !bssid) {
+        strncpy(lastError, "missing target bssid", sizeof(lastError) - 1);
+        return;
+    }
+
+    fullChannelMode = fullChannel;
+    captureChannel = channel;
+    if (bssid) memcpy(targetBssid, bssid, 6);
+    else memset(targetBssid, 0, sizeof(targetBssid));
+
+    frameCount = 0;
+    eapolCount = 0;
+    pmkidCount = 0;
+    handshakeFound = false;
+    pmkidFound = false;
+    pmkidStored = 0;
+    capSummary[0] = '\0';
+    pmkidBuf = "";
+    resetHandshakeState();
+    firstFrameSeen = false;
+    idleWarningShown = false;
+    startMs = millis();
+    lastDiagMs = startMs;
+    rawChannelFrames = 0;
+    savedBeaconFrames = 0;
+    savedProbeRespFrames = 0;
+    pcapDroppedRecords = 0;
+    pcapActivePos = 0;
+    pcapFlushLen = 0;
+    pcapFlushPending = false;
+
+    stopManagementAp();
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_MODE_STA);
+    WiFi.disconnect(false, true);
+    WiFi.setSleep(false);
+
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    esp_wifi_set_channel(captureChannel, WIFI_SECOND_CHAN_NONE);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+
+    wifi_promiscuous_filter_t filter = {
+        .filter_mask = WIFI_PROMIS_FILTER_MASK_MGMT | WIFI_PROMIS_FILTER_MASK_DATA
+    };
+    esp_wifi_set_promiscuous_filter(&filter);
+    esp_wifi_set_promiscuous_rx_cb(rxCallback);
+    esp_wifi_set_promiscuous(true);
+
+    pcapWritePos = sizeof(PCAP_GHDR);
+    latestPcapKnown = false;
+    if (fsReady) {
+        if (fileExistsNoisySafe(kLatestPcapPath)) {
+            LittleFS.remove(kLatestPcapPath);
+        }
+        pcapFile = LittleFS.open(kLatestPcapPath, FILE_WRITE);
+        if (pcapFile) {
+            pcapFileOpen = true;
+            pcapFile.write(PCAP_GHDR, sizeof(PCAP_GHDR));
+        } else {
+            strncpy(lastError, "pcap file open failed", sizeof(lastError) - 1);
+        }
+    }
+    isRunning = true;
+
+    char bssidStr[18];
+    macStr(targetBssid, bssidStr);
+    Serial.printf("[Capture] Passive sniff start Ch=%u mode=%s target=%s\n",
+                  captureChannel, fullChannelMode ? "full" : "target",
+                  fullChannelMode ? "<all>" : bssidStr);
+    Serial.println("[Capture] WiFi mode=STA promiscuous");
+    Serial.println("[Capture] Waiting for matching traffic...");
+}
+
+void stop() {
+    if (isRunning) {
+        esp_wifi_set_promiscuous_rx_cb(nullptr);
+        esp_wifi_set_promiscuous(false);
+        esp_wifi_stop();
+        isRunning = false;
+        closePcapFile();
+        Serial.printf("[Capture] Done: frames=%lu eapol=%lu hs=%s pmkid=%lu\n",
+                      (unsigned long)frameCount,
+                      (unsigned long)eapolCount,
+                      handshakeFound ? "YES" : "no",
+                      (unsigned long)pmkidCount);
+        if (fsReady) {
+            const uint32_t elapsedSec = (millis() - startMs) / 1000;
+            size_t latestSize = fileSizeNoisySafe(kLatestPcapPath);
+            bool pcapSaved = latestSize == pcapWritePos && latestSize > sizeof(PCAP_GHDR);
+            latestPcapKnown = pcapSaved;
+
+            const char* pmkidData = getPmkidData();
+            size_t pmkidSize = strlen(pmkidData);
+            if (fileExistsNoisySafe(kLatestPmkidPath)) {
+                LittleFS.remove(kLatestPmkidPath);
+            }
+            File pmkidFile = LittleFS.open(kLatestPmkidPath, FILE_WRITE);
+            bool pmkidSaved = false;
+            if (pmkidFile) {
+                pmkidSaved = (pmkidFile.write((const uint8_t*)pmkidData, pmkidSize) == pmkidSize);
+                pmkidFile.close();
+            }
+            latestPmkidKnown = pmkidSaved && pmkidSize > 0;
+
+            String meta = buildSessionMetaJson(elapsedSec);
+            if (fileExistsNoisySafe(kLatestMetaPath)) {
+                LittleFS.remove(kLatestMetaPath);
+            }
+            File metaFile = LittleFS.open(kLatestMetaPath, FILE_WRITE);
+            bool metaSaved = false;
+            if (metaFile) {
+                metaSaved = (metaFile.print(meta) == meta.length());
+                metaFile.close();
+            }
+            latestMetaKnown = metaSaved;
+
+            Serial.printf("[Capture] Saved latest capture: pcap=%s (%u B, dropped=%lu), pmkid=%s (%u B), meta=%s\n",
+                          pcapSaved ? "ok" : "fail",
+                          (unsigned)latestSize,
+                          (unsigned long)pcapDroppedRecords,
+                          pmkidSaved ? "ok" : "fail",
+                          (unsigned)pmkidSize,
+                          metaSaved ? "ok" : "fail");
+        }
+    }
+
+    startManagementAp();
+}
+
+void loop() {
+    if (!isRunning) return;
+    flushPendingPcapChunk();
+
+    uint32_t now = millis();
+    if (now - lastDiagMs >= 10000) {
+        lastDiagMs = now;
+        if (!firstFrameSeen && !idleWarningShown) {
+            idleWarningShown = true;
+            Serial.printf("[Capture] No matching target frames after %lus. Raw channel frames=%lu. If raw>0, BSSID filter/target is wrong; if raw=0, radio is not seeing channel traffic.\n",
+                          (unsigned long)((now - startMs) / 1000),
+                          (unsigned long)rawChannelFrames);
+            Serial.println("[Capture] Also verify the target network uses WPA/WPA2 and that a client is actually reconnecting.");
+        } else {
+            Serial.printf("[Capture] Listening... raw=%lu target=%lu eapol=%lu pmkid=%lu elapsed=%lus\n",
+                          (unsigned long)rawChannelFrames,
+                          (unsigned long)frameCount,
+                          (unsigned long)eapolCount,
+                          (unsigned long)pmkidCount,
+                          (unsigned long)((now - startMs) / 1000));
+        }
+    }
+}
+
+void reset() {
+    stop();
+    pcapWritePos = 0;
+    pmkidBuf = "";
+    capSummary[0] = '\0';
+    lastError[0] = '\0';
+    frameCount = 0;
+    eapolCount = 0;
+    pmkidCount = 0;
+    handshakeFound = false;
+    pmkidFound = false;
+    pmkidStored = 0;
+    resetHandshakeState();
+}
+
+bool usesFullChannel() {
+    return fullChannelMode;
+}
+
+bool managementApActive() {
+    return apActive;
+}
+
+bool hasLatestCapture() {
+    return fsReady && latestPcapKnown;
+}
+
+bool hasLatestMetadata() {
+    return fsReady && latestMetaKnown;
+}
+
+size_t getLatestPcapSize() {
+    if (!fsReady || !latestPcapKnown) return 0;
+    if (!LittleFS.exists(kLatestPcapPath)) {
+        latestPcapKnown = false;
+        return 0;
+    }
+    File f = LittleFS.open(kLatestPcapPath, FILE_READ);
+    if (!f) return 0;
+    size_t sz = f.size();
+    f.close();
+    return sz;
+}
+
+size_t getLatestPmkidSize() {
+    if (!fsReady || !latestPmkidKnown) return 0;
+    if (!LittleFS.exists(kLatestPmkidPath)) {
+        latestPmkidKnown = false;
+        return 0;
+    }
+    File f = LittleFS.open(kLatestPmkidPath, FILE_READ);
+    if (!f) return 0;
+    size_t sz = f.size();
+    f.close();
+    return sz;
+}
+
+size_t getLatestMetaSize() {
+    if (!fsReady || !latestMetaKnown) return 0;
+    if (!LittleFS.exists(kLatestMetaPath)) {
+        latestMetaKnown = false;
+        return 0;
+    }
+    File f = LittleFS.open(kLatestMetaPath, FILE_READ);
+    if (!f) return 0;
+    size_t sz = f.size();
+    f.close();
+    return sz;
+}
+
+const char* getLastError() {
+    return lastError[0] ? lastError : "";
+}
+
+const uint8_t* getPcapData() {
+    return nullptr;
+}
+
+size_t getPcapSize() {
+    return pcapWritePos;
+}
+
+const char* getPmkidData() {
+    pmkidBuf = "";
+    pmkidBuf.reserve(pmkidStored * 64);
+    for (int i = 0; i < pmkidStored; ++i) {
+        char apStr[18], staStr[18], pmkidHex[33];
+        macStr(pmkidApList[i].data(), apStr);
+        macStr(pmkidStaList[i].data(), staStr);
+        for (int j = 0; j < 16; ++j) {
+            snprintf(pmkidHex + j * 2, 3, "%02X", pmkidList[i][j]);
+        }
+        pmkidBuf += "WPA*02*";
+        pmkidBuf += pmkidHex;
+        pmkidBuf += "*";
+        pmkidBuf += apStr;
+        pmkidBuf += "*";
+        pmkidBuf += staStr;
+        pmkidBuf += "***\n";
+    }
+    return pmkidBuf.c_str();
+}
+
+size_t getPmkidSize() {
+    return strlen(getPmkidData());
+}
+
+bool loadLatestPcap(std::vector<uint8_t>& out) {
+    if (!fsReady || !latestPcapKnown) return false;
+    if (!LittleFS.exists(kLatestPcapPath)) {
+        latestPcapKnown = false;
+        return false;
+    }
+    File f = LittleFS.open(kLatestPcapPath, FILE_READ);
+    if (!f) return false;
+    out.resize(f.size());
+    bool ok = (f.read(out.data(), out.size()) == (int)out.size());
+    f.close();
+    return ok;
+}
+
+bool loadLatestPmkid(String& out) {
+    if (!fsReady || !latestPmkidKnown) return false;
+    if (!LittleFS.exists(kLatestPmkidPath)) {
+        latestPmkidKnown = false;
+        return false;
+    }
+    File f = LittleFS.open(kLatestPmkidPath, FILE_READ);
+    if (!f) return false;
+    out = f.readString();
+    f.close();
+    return true;
+}
+
+bool loadLatestMeta(String& out) {
+    if (!fsReady || !latestMetaKnown) return false;
+    if (!LittleFS.exists(kLatestMetaPath)) {
+        latestMetaKnown = false;
+        return false;
+    }
+    File f = LittleFS.open(kLatestMetaPath, FILE_READ);
+    if (!f) return false;
+    out = f.readString();
+    f.close();
+    return true;
+}
+
+bool clearLatestSaved() {
+    if (!fsReady) return false;
+    bool ok = true;
+    if (LittleFS.exists(kLatestPcapPath)) ok = LittleFS.remove(kLatestPcapPath) && ok;
+    if (LittleFS.exists(kLatestPmkidPath)) ok = LittleFS.remove(kLatestPmkidPath) && ok;
+    if (LittleFS.exists(kLatestMetaPath)) ok = LittleFS.remove(kLatestMetaPath) && ok;
+    latestPcapKnown = false;
+    latestPmkidKnown = false;
+    latestMetaKnown = false;
+    return ok;
+}
+
+const char* getCaptureSummary() {
+    if (!capSummary[0]) {
+        updateSummary();
+    }
+    return capSummary[0] ? capSummary : "idle";
+}
+
+uint32_t getRawChannelFrames() {
+    return rawChannelFrames;
+}
+
+uint32_t getTargetFrames() {
+    return frameCount;
+}
+
+}  // namespace Capture
