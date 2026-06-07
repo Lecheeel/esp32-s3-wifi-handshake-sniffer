@@ -1,6 +1,6 @@
 # ESP32-S3 WiFi Handshake Sniffer
 
-## 中文简介
+## 简介
 
 ESP32-S3 WiFi Handshake Sniffer 是一个基于 ESP32-S3、PlatformIO 和 Arduino 框架的 WiFi 握手包 / PMKID 被动监听工具。设备启动后会创建本地管理热点，并提供一个中文 Web UI，用于扫描附近 AP、选择目标 BSSID 和信道、启动监听、查看抓取状态，并下载抓取结果。
 
@@ -81,7 +81,7 @@ stop   - 停止抓包，保存结果，并恢复管理热点
 - 抓包期间管理 AP 会关闭，停止抓包后才会恢复。
 - 本项目不会主动发送解除认证帧，只做被动监听。
 
-## English Overview
+## Overview
 
 ESP32-S3 WiFi Handshake Sniffer is a lightweight WiFi handshake and PMKID sniffer built for ESP32-S3 with PlatformIO and the Arduino framework. The device starts a local management access point with a browser-based Web UI for AP scanning, target selection, passive monitor-mode capture, status tracking, and result downloads.
 
