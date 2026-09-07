@@ -57,13 +57,19 @@ std::vector<APInfo> scanNetworks() {
         info.channel    = WiFi.channel(i);
         info.encryption = WiFi.encryptionType(i);
 
+        if (info.encryption == WIFI_AUTH_WPA2_ENTERPRISE) {
+            Serial.printf("[Scanner] Skipping WPA2 Enterprise AP SSID=\"%s\" BSSID=%s channel=%d\n",
+                          info.ssid.c_str(), info.bssid.c_str(), info.channel);
+            continue;
+        }
+
         if (info.ssid.isEmpty()) {
             info.ssid = "<hidden>";
         }
 
-        Serial.printf("  [%d] %s (%s) Ch:%d RSSI:%d\n",
+        Serial.printf("[Scanner] AP[%d] SSID=\"%s\" BSSID=%s channel=%d RSSI=%d security=%d\n",
                       i, info.ssid.c_str(), info.bssid.c_str(),
-                      info.channel, info.rssi);
+                      info.channel, info.rssi, info.encryption);
 
         results.push_back(info);
     }
